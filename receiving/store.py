@@ -56,6 +56,19 @@ CREATE TABLE IF NOT EXISTS receipts (
     UNIQUE (kind, material_id),
     CHECK ((kind = 'correction') = (account_id IS NOT NULL))
 );
+CREATE TABLE IF NOT EXISTS handoffs (
+    handoff_id TEXT PRIMARY KEY NOT NULL,
+    day TEXT NOT NULL,
+    original_account_id INTEGER NOT NULL REFERENCES accounts (account_id),
+    corrected_account_id INTEGER REFERENCES accounts (account_id),
+    status TEXT NOT NULL CHECK (status IN ('original', 'pending', 'complete')),
+    correction_stage TEXT NOT NULL CHECK (correction_stage IN ('declared', 'ruled', 'posted')),
+    original_message TEXT NOT NULL,
+    correction_message TEXT,
+    original_receipt TEXT,
+    correction_receipt TEXT,
+    original_blocked INTEGER NOT NULL DEFAULT 0
+);
 COMMIT;
 '''
 

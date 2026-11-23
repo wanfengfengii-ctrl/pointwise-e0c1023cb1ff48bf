@@ -5,12 +5,14 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from accounts.history import get_account
-from accounts.publish import load_current_basis, publish_day
+from accounts.publish import (acknowledge_handoff, amend_handoff, get_handoff,
+                              load_current_basis, publish_day, resume_handoff, start_handoff)
 from audit.cuts import freeze_station_cut
 from audit.reconcile import record_reconciliation
 from audit.release import issue_correction
 from receiving.audit_intake import accept_correction, load_accepted_correction
 from receiving.intake import accept_block
+from receiving.monthly import accept_month_message, open_month_store, read_month_entries
 from receiving.receipts import load_receipt
 from receiving.store import CenterCommitError, open_center_store
 from shipping.pack import issue_block
@@ -183,6 +185,96 @@ def run_demo(directory):
         print('Fixed daily accounts:', ', '.join(f'{a.account_id} = {a.total_liters} L' for a in history))
 
 
+def handoff_wire(message):
+    return json.loads(json.dumps(message, allow_nan=False))
+
+
+def prepare_handoff_case(directory):
+    directory = Path(directory)
+    directory.mkdir(parents=True)
+    center_path = directory / 'center.sqlite'
+    with closing(open_center_store(center_path)) as center:
+        with closing(open_station_store(directory / 'source.sqlite')) as source:
+            notice, blocks, _ = prepare_day(source)
+            original = deliver_and_retire(source, center, blocks)
+        corrected = get_account(center, accept_correction(center, notice).account_id)
+    return center_path, original, corrected
+
+
+def entry_rows(entries):
+    return [[entry['kind'], entry['liters'], entry['original_posted']] for entry in entries]
+
+
+def describe_entries(entries):
+    return ', '.join(f"{entry['liters']} L {entry['kind']}" for entry in entries)
+
+
+def handoff_state(handoff):
+    receipts = []
+    for key in ('original_receipt', 'correction_receipt'):
+        receipt = handoff[key]
+        receipts.append(None if receipt is None else receipt['liters'])
+    return [handoff['status'], *receipts]
+
+
+def run_handoff_demo(directory):
+    directory = Path(directory)
+    center_path, original, corrected = prepare_handoff_case(directory / 'original-first')
+    with closing(open_center_store(center_path)) as center, \
+            closing(open_month_store(center_path.parent / 'month.sqlite')) as month:
+        original_message = start_handoff(center, 'handoff-1', original.account_id)
+        declare = amend_handoff(center, 'handoff-1', corrected.account_id)
+        lost = accept_month_message(month, handoff_wire(original_message))
+        correction_reply = accept_month_message(month, handoff_wire(declare))
+        acknowledge_handoff(center, 'handoff-1', handoff_wire(correction_reply))
+        entries = read_month_entries(month, DAY)
+        resumed = resume_handoff(center, 'handoff-1', 'original')
+        replayed = accept_month_message(month, handoff_wire(resumed))
+        if replayed != lost:
+            raise AssertionError('redelivered original message returned a different reply')
+        acknowledge_handoff(center, 'handoff-1', handoff_wire(replayed))
+        state = get_handoff(center, 'handoff-1')
+        show_scenario('H1.original_first',
+                      {'order': ['original', 'correction'], 'lost_reply': 'original',
+                       'accounts': [original.total_liters, corrected.total_liters]},
+                      [['original', 14, True], ['correction', 91, True]], entry_rows(entries),
+                      ['complete', 14, 91], handoff_state(state),
+                      ['accounts/publish.py', 'receiving/monthly.py', 'receiving/handoff_wire.py'],
+                      'original posts 14 first; correction appends 105 - 14 = 91; '
+                      'the lost original reply is acknowledged afterwards')
+        print('Month entries (original first):', describe_entries(entries))
+    center_path, original, corrected = prepare_handoff_case(directory / 'correction-first')
+    with closing(open_center_store(center_path)) as center, \
+            closing(open_month_store(center_path.parent / 'month.sqlite')) as month:
+        original_message = start_handoff(center, 'handoff-1', original.account_id)
+        declare = amend_handoff(center, 'handoff-1', corrected.account_id)
+        pending = accept_month_message(month, handoff_wire(declare))
+        blocked = accept_month_message(month, handoff_wire(original_message))
+        if pending['status'] != 'pending' or blocked['status'] != 'blocked':
+            raise AssertionError('expected a pending declaration and a blocked original')
+        acknowledge_handoff(center, 'handoff-1', handoff_wire(blocked))
+        replayed = accept_month_message(month, handoff_wire(declare))
+        if replayed != pending:
+            raise AssertionError('redelivered declaration returned a different reply')
+        acknowledge_handoff(center, 'handoff-1', handoff_wire(replayed))
+        settle = resume_handoff(center, 'handoff-1', 'correction')
+        posted = accept_month_message(month, handoff_wire(settle))
+        acknowledge_handoff(center, 'handoff-1', handoff_wire(posted))
+        entries = read_month_entries(month, DAY)
+        state = get_handoff(center, 'handoff-1')
+        show_scenario('H2.correction_first',
+                      {'order': ['correction', 'original'], 'lost_reply': 'pending',
+                       'accounts': [original.total_liters, corrected.total_liters]},
+                      [['correction', 105, False]], entry_rows(entries),
+                      ['complete', None, 105], handoff_state(state),
+                      ['accounts/publish.py', 'receiving/monthly.py', 'receiving/handoff_wire.py'],
+                      'the ruling seals the original first; the settlement posts the full 105 '
+                      'and the late original stays blocked')
+        print('Month entries (correction first):', describe_entries(entries))
+
+
 if __name__ == '__main__':
     with TemporaryDirectory() as directory:
         run_demo(directory)
+    with TemporaryDirectory() as directory:
+        run_handoff_demo(directory)
